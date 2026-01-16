@@ -1,78 +1,60 @@
 # 🧠 MARTINE IA - Documentation Technique Permanente
 
-Ce document décrit l'architecture, le fonctionnement et la configuration de l'outil **Martine IA**. Il sert de référence technique pour la maintenance et les évolutions futures.
+## 1. Architecture et Orchestration
+
+L'outil est scindé en deux moteurs principaux :
+
+### A. Moteur de Projets (`src/estimate_projects.py`)
+- **Unité** : Semaines.
+- **Logique "Senior PM"** : Utilise GPT-4o pour estimer la durée globale d'un projet en fonction :
+    - Du descriptif et des notes de page.
+    - Du résumé des tâches liées (les 10 premières).
+    - Du contexte global (Ordre, Statut, Priorité).
+    - De l'historique des projets passés similaires.
+- **Filtres Métier** :
+    - **Quick Win** : Plafonne la réponse IA.
+    - **Au long court** : Identifié via la colonne `Ordre`, force la mise à 0 de `ACTU`.
+
+### B. Moteur de Tâches (`src/main.py`)
+- **Unité** : Heures (décimales, arrondi au 1/4 d'heure).
+- **Cible** : Uniquement les "feuilles" (tâches sans sous-éléments) de type "Tâche".
+- **Contextualisation** : Récupère le contenu complet de la page pour une précision maximale.
 
 ---
 
-## 1. Architecture du Système
+## 2. Détection Intelligente des Changements
 
-L'outil est conçu comme une application Python modulaire qui automatise la gestion du temps dans Notion via l'intelligence artificielle d'OpenAI.
+Martine IA implémente un système de **Hashage SHA-256** pour l'auto-ré-estimation.
 
-### 📁 Structure des fichiers
-- **`.env`** : Variables de configuration (Tokens, IDs de base de données).
-- **`src/main.py`** : Script principal (Logique métier et orchestration).
-- **`src/notion_client.py`** : Interface avec l'API Notion (Lecture/Écriture).
-- **`src/gpt_estimator.py`** : Moteur d'IA (Génération des estimations).
-- **`logs/`** : Historique des estimations générées au format JSON.
+### Processus :
+1. **Concaténation** des données : `Nom + Description + Contenu Page + Résumé Tâches + Contexte`.
+2. **Calcul** du hash SHA-256.
+3. **Comparaison** avec le champ `🤖⏱️Hash Source IA` dans Notion.
+4. **Trigger** : Si Hash différent $\rightarrow$ Envoi à l'IA $\rightarrow$ Mise à jour de `ACTU` + Nouveau Hash.
 
----
-
-## 2. Fonctionnement Détaillé
-
-### Cycle d'exécution
-Le script suit un processus rigoureux pour garantir la fiabilité des données :
-
-1.  **Extraction** : Scan de la base Notion synchronisée.
-2.  **Filtrage strict** :
-    *   **Type** : Uniquement les éléments dont la colonne `Type` contient "Tâche".
-    *   **Feuilles uniquement** : Exclusion des tâches parents (celles ayant des "Sous-éléments") pour éviter les doublons.
-    *   **Vierge** : Seuls les éléments sans estimation existante (ou à 0) sont traités.
-3.  **Contextualisation** : Pour chaque tâche éligible, le script récupère :
-    *   Le titre et la description.
-    *   Le contenu complet de la page Notion (texte, listes, etc.).
-    *   L'historique des 10 dernières tâches similaires (même projet) ayant un temps réel renseigné.
-4.  **Estimation IA** : Envoi du contexte à GPT-4o.
-5.  **Injection** : Écriture de la valeur dans la colonne Notion cible.
+> [!TIP]
+> Pour forcer une ré-estimation sans rien changer, videz simplement la colonne `ACTU` ou le champ `Hash` dans Notion.
 
 ---
 
-## 3. Configuration de la Base Notion
+## 3. Configuration Notion (Base Projets)
 
-L'outil s'appuie sur une structure de base de données spécifique nommée **"Tâches IA"**.
-
-### Propriétés Requises (Colonnes) :
-| Nom de colonne | Type | Usage |
-| :--- | :--- | :--- |
-| `Nom` | Titre | Nom de la tâche utilisé par l'IA. |
-| `Type` | Select | Filtre (doit être "Tâche"). |
-| `Sous-élément` | Relation | Permet d'identifier si c'est une sous-tâche (feuille). |
-| `🤖⏱️Temps est IA (h) ENFANT` | Nombre | Cible où l'IA écrit son estimation (en heures décimales). |
-| `Description` | Texte | Contexte supplémentaire pour l'IA. |
-| `Projet/Tlt` | Relation | Utilisé pour regrouper les tâches par contexte projet. |
+| Propriété | Usage Technique |
+| :--- | :--- |
+| `🤖⏱️I Durée est IA INIT (sem)` | Valeur de référence (écrite 1 seule fois). |
+| `🤖⏱️A Durée est IA ACTU (sem)` | Valeur vivante, mise à jour par l'IA au moindre changement. |
+| `🤖⏱️Hash Source IA` | Stockage de l'empreinte pour la détection de modifications. |
+| `Ordre` | Utilisé pour détecter les "Quick Win" et "Au long court". |
+| `Tâches IA` | Relation utilisée pour extraire le résumé des tâches. |
 
 ---
 
-## 4. Logique de l'IA (Le "Cerveau")
+## 4. Multi-modèles (GPT / Gemini)
 
-L'estimation ne repose pas sur une simple hypothèse, mais sur une analyse comparative :
-
-### Le Raisonnement :
-- **Analyse du contenu** : L'IA ne se contente pas du titre ; elle "lit" les étapes détaillées listées dans la page Notion pour évaluer la complexité réelle.
-- **Récalibrage par l'historique** : En voyant que "Créer une maquette" a pris 4h par le passé, elle ajustera son estimation pour une tâche similaire au lieu de donner une valeur générique.
-- **Formatage** : L'IA est instruite pour fournir un nombre entier de minutes, que le script convertit ensuite en heures décimales (arrondi au quart d'heure) pour Notion.
+Le système est agnostique du modèle d'IA :
+- **GPT-4o** : Utilisé par défaut pour les projets pour sa vision "Senior PM".
+- **Gemini** : Configurable dans le `.env` pour les tâches massives.
 
 ---
 
-## 5. Maintenance et Dépannage
-
-### Ajouter une nouvelle colonne
-Si vous changez le nom d'une colonne dans Notion, vous devez mettre à jour les constantes au début de `src/main.py` (variables `PROP_...`).
-
-### Erreurs fréquentes
-- **SyntaxError (HEAD/====)** : Indique un conflit de fusion Git non résolu. Nettoyer le fichier `main.py` pour supprimer ces marqueurs.
-- **401 Unauthorized** : Le `NOTION_TOKEN` dans le `.env` est expiré ou le script n'a plus accès à la page Notion (vérifier l'accès à l'intégration).
-- **Estimations à zéro** : Vérifier que le `Type` est bien "Tâche" et que l'élément n'est pas un parent.
-
----
-
-*Document mis à jour le : 09/01/2026*
+*Dernière mise à jour technique : 16/01/2026*
