@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import time
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -55,6 +56,7 @@ PROP_DESCRIPTION = "Description"
 PROP_DUREE_INIT = "🤖⏱️I Durée est IA INIT (sem)"  # Corrigé 'I'
 PROP_DUREE_ACTU = "🤖⏱️A Durée est IA ACTU (sem)"  # Corrigé 'A'
 PROP_TACHES = "Tâches IA"  # Corrigé 'IA'
+PROP_HASH = "🤖⏱️Hash Source IA"  # Nouvelle propriété pour détection de changements
 
 # Mode DEBUG (ne modifie pas Notion)
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -80,6 +82,19 @@ def get_property_value(page: dict, prop_name: str):
         return notion.get_property_value(page, prop_name)
     except Exception:
         return None
+
+
+def calculate_project_hash(project_data: dict) -> str:
+    """Calcule un hash SHA-256 des données sources du projet"""
+    # On concatène les infos structurantes
+    input_str = (
+        f"{project_data.get('nom', '')}|"
+        f"{project_data.get('description', '')}|"
+        f"{project_data.get('content', '')}|"
+        f"{project_data.get('tasks_summary', '')}|"
+        f"{project_data.get('full_context', '')}"
+    )
+    return hashlib.sha256(input_str.encode('utf-8')).hexdigest()
 
 
 def get_projects_to_estimate() -> list:
@@ -119,38 +134,14 @@ def get_projects_to_estimate() -> list:
                 skipped_already += 1
             continue
 
-        # Si DUREE_INIT pleine mais ACTU vide -> On RE-ESTIME via IA (nouveau calcul)
-        duree_init = get_property_value(project, PROP_DUREE_INIT)
-        duree_actu = get_property_value(project, PROP_DUREE_ACTU)
-        
-        should_reestimate = False
-        is_initial = False
-        
-        if not duree_init or duree_init <= 0:
-            # Cas normal: premier calcul
-            should_reestimate = True
-            is_initial = True
-        elif not duree_actu or duree_actu <= 0:
-            # Cas ré-estimation: INIT est là mais on a vidé ACTU manuellement
-            print(f"   🔄 Ré-estimation IA demandée (ACTU vide) pour: {nom}")
-            should_reestimate = True
-            is_initial = False
-        
-        if not should_reestimate:
-            print(f"   SKIP déjà estimé: {nom} ({duree_init} sem)")
-            skipped_already += 1
-            continue
-        
         # Récupérer les infos du projet
         description = get_property_value(project, PROP_DESCRIPTION) or ""
         
         # Récupérer TOUTES les propriétés pour le contexte (Ordre, Statut, etc.)
         properties_context = []
         for prop_name, prop_data in project.get("properties", {}).items():
-            # On ignore les champs techniques ou déjà gérés
             if prop_name in [PROP_NOM, PROP_DESCRIPTION, PROP_DUREE_INIT, PROP_DUREE_ACTU, PROP_TACHES]:
                 continue
-            
             try:
                 val = get_property_value(project, prop_name)
                 if val:
@@ -159,8 +150,6 @@ def get_projects_to_estimate() -> list:
                 pass
         
         full_context = "\n".join(properties_context)
-        
-        # Récupérer le contenu de la page (notes de cadrage, etc.)
         print(f"   📄 Lecture du contenu: {nom}")
         try:
             content = notion.get_page_content(page_id)
@@ -168,9 +157,46 @@ def get_projects_to_estimate() -> list:
             print(f"   ⚠️ Impossible de lire le contenu: {e}")
             content = ""
         
-        # Récupérer les tâches liées
         taches_ids = get_property_value(project, PROP_TACHES) or []
         tasks_summary = get_tasks_summary(taches_ids)
+
+        # --- LOGIQUE DE DÉTECTION DE CHANGEMENT (HASH) ---
+        current_data = {
+            "nom": nom,
+            "description": description,
+            "content": content,
+            "tasks_summary": tasks_summary,
+            "full_context": full_context
+        }
+        current_hash = calculate_project_hash(current_data)
+        stored_hash = get_property_value(project, PROP_HASH)
+        
+        duree_init = get_property_value(project, PROP_DUREE_INIT)
+        duree_actu = get_property_value(project, PROP_DUREE_ACTU)
+        
+        should_reestimate = False
+        is_initial = False
+        reason = ""
+        
+        if not duree_init or duree_init <= 0:
+            should_reestimate = True
+            is_initial = True
+            reason = "Première estimation"
+        elif current_hash != stored_hash:
+            print(f"   ✨ CHANGEMENT DÉTECTÉ pour: {nom}")
+            should_reestimate = True
+            is_initial = False
+            reason = "Mise à jour des infos"
+        elif not duree_actu or duree_actu <= 0:
+            print(f"   🔄 Ré-estimation IA demandée (ACTU vide) pour: {nom}")
+            should_reestimate = True
+            is_initial = False
+            reason = "Forçage manuel (ACTU vide)"
+        
+        if not should_reestimate:
+            print(f"   SKIP déjà à jour: {nom}")
+            skipped_already += 1
+            continue
         
         to_estimate.append({
             "id": page_id,
@@ -180,7 +206,9 @@ def get_projects_to_estimate() -> list:
             "tasks_summary": tasks_summary,
             "full_context": full_context,
             "action": "ESTIMATE",
-            "is_initial": is_initial
+            "is_initial": is_initial,
+            "new_hash": current_hash,
+            "reason": reason
         })
     
     print(f"\n📊 Résumé:")
@@ -265,20 +293,12 @@ def get_historical_projects() -> list:
     return history
 
 
-def update_project_estimate(page_id: str, weeks: float, is_initial: bool = False) -> bool:
+def update_project_estimate(page_id: str, weeks: float, is_initial: bool = False, new_hash: str = None) -> bool:
     """
-    Met à jour l'estimation d'un projet dans Notion.
-    
-    Args:
-        page_id: ID de la page Notion
-        weeks: Durée estimée en semaines
-        is_initial: Si True, met à jour aussi DUREE_INIT
-    
-    Returns:
-        True si succès
+    Met à jour l'estimation et le hash d'un projet dans Notion.
     """
     if DEBUG_MODE:
-        print(f"   [DEBUG] Simulation écriture: {weeks} semaines")
+        print(f"   [DEBUG] Simulation écriture: {weeks} semaines (hash: {new_hash[:8] if new_hash else 'N/A'})")
         return True
     
     try:
@@ -288,6 +308,9 @@ def update_project_estimate(page_id: str, weeks: float, is_initial: bool = False
         
         if is_initial:
             properties[PROP_DUREE_INIT] = {"number": weeks}
+            
+        if new_hash:
+            properties[PROP_HASH] = {"rich_text": [{"text": {"content": new_hash}}]}
         
         success = notion.update_page(page_id, properties)
         return success
@@ -298,6 +321,17 @@ def update_project_estimate(page_id: str, weeks: float, is_initial: bool = False
 
 def run_estimations():
     """Lance les estimations GPT et met à jour Notion"""
+    
+    # --- PRÉ-REQUIS : Vérifier l'existence de la colonne HASH ---
+    print("🔍 Vérification du schéma Notion...")
+    try:
+        schema = notion.get_database_schema(DB_PROJETS_IA)
+        if PROP_HASH not in schema:
+            print(f"   🏗️  Création de la colonne '{PROP_HASH}'...")
+            notion.add_property_to_database(DB_PROJETS_IA, PROP_HASH, {"rich_text": {}})
+    except Exception as e:
+        print(f"   ⚠️ Impossible de vérifier le schéma: {e}")
+
     # Init GPT
     api_key = os.getenv("GPT_API_KEY")
     model = os.getenv("GPT_MODEL", "gpt-4o")
@@ -324,6 +358,8 @@ def run_estimations():
     
     for i, project in enumerate(projects, 1):
         print(f"\n📦 Projet {i}/{len(projects)}: {project['nom']}")
+        if project.get("reason"):
+            print(f"   Motif: {project['reason']}")
         
         action = project.get("action", "ESTIMATE")
         
@@ -361,7 +397,8 @@ def run_estimations():
             success = update_project_estimate(
                 project["id"], 
                 estimated_weeks, 
-                is_initial=project.get("is_initial", False)
+                is_initial=project.get("is_initial", False),
+                new_hash=project.get("new_hash")
             )
             
             if success:
