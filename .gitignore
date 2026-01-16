@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+logs/
+.vscode/
+.idea/
+debug_*.py
+debug_*.txt
+test_connexion.py
