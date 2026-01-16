@@ -119,22 +119,26 @@ def get_projects_to_estimate() -> list:
                 skipped_already += 1
             continue
 
-        # Vérifier si DUREE_INIT déjà remplie
+        # Si DUREE_INIT pleine mais ACTU vide -> On RE-ESTIME via IA (nouveau calcul)
         duree_init = get_property_value(project, PROP_DUREE_INIT)
-        if duree_init and duree_init > 0:
-            # On vérifie si ACTU est vide, si oui on le remplit
-            duree_actu = get_property_value(project, PROP_DUREE_ACTU)
-            if not duree_actu:
-                print(f"   🔄 MAJ ACTU manquante pour: {nom}")
-                to_estimate.append({
-                    "id": page_id,
-                    "nom": nom,
-                    "action": "UPDATE_ACTU_ONLY",
-                    "value": duree_init
-                })
-            else:
-                print(f"   SKIP déjà estimé: {nom} ({duree_init} sem)")
-                skipped_already += 1
+        duree_actu = get_property_value(project, PROP_DUREE_ACTU)
+        
+        should_reestimate = False
+        is_initial = False
+        
+        if not duree_init or duree_init <= 0:
+            # Cas normal: premier calcul
+            should_reestimate = True
+            is_initial = True
+        elif not duree_actu or duree_actu <= 0:
+            # Cas ré-estimation: INIT est là mais on a vidé ACTU manuellement
+            print(f"   🔄 Ré-estimation IA demandée (ACTU vide) pour: {nom}")
+            should_reestimate = True
+            is_initial = False
+        
+        if not should_reestimate:
+            print(f"   SKIP déjà estimé: {nom} ({duree_init} sem)")
+            skipped_already += 1
             continue
         
         # Récupérer les infos du projet
@@ -175,7 +179,8 @@ def get_projects_to_estimate() -> list:
             "content": content,
             "tasks_summary": tasks_summary,
             "full_context": full_context,
-            "action": "ESTIMATE"
+            "action": "ESTIMATE",
+            "is_initial": is_initial
         })
     
     print(f"\n📊 Résumé:")
@@ -350,17 +355,18 @@ def run_estimations():
             historical_projects=historical
         )
         
-        if estimated_weeks is not None: # Peut être 0.5
+        if estimated_weeks is not None:
             print(f"   ✅ Estimation: {estimated_weeks} semaines")
             
             success = update_project_estimate(
                 project["id"], 
                 estimated_weeks, 
-                is_initial=True
+                is_initial=project.get("is_initial", False)
             )
             
             if success:
-                print(f"   💾 Écrit dans Notion (INIT + ACTU)")
+                mode_str = "INIT + ACTU" if project.get("is_initial") else "ACTU uniquement"
+                print(f"   💾 Écrit dans Notion ({mode_str})")
                 updated += 1
             else:
                 print(f"   ❌ Échec écriture")
